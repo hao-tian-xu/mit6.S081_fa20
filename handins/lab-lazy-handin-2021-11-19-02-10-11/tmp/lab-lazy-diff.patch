@@ -1,0 +1,222 @@
+diff --git a/Makefile b/Makefile
+index 1fa367e..786e848 100644
+--- a/Makefile
++++ b/Makefile
+@@ -252,7 +252,9 @@ clean:
+ 	$U/initcode $U/initcode.out $K/kernel fs.img \
+ 	mkfs/mkfs .gdbinit \
+         $U/usys.S \
+-	$(UPROGS)
++	$(UPROGS) \
++	*/*[2-9]* \
++	.*[2-9] *[2-9]*
+ 
+ # try to generate a unique GDB port
+ GDBPORT = $(shell expr `id -u` % 5000 + 25000)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 4b9bbc0..e51d729 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -185,3 +185,5 @@ void            virtio_disk_intr(void);
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
++
++#define LAB_LAZY 1
+\ No newline at end of file
+diff --git a/kernel/proc.c b/kernel/proc.c
+index ebbf5a2..5eb4c64 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -242,10 +242,15 @@ growproc(int n)
+   struct proc *p = myproc();
+ 
+   sz = p->sz;
++
+   if(n > 0){
++#ifdef LAB_LAZY
++    sz += n;
++#else
+     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+       return -1;
+     }
++#endif
+   } else if(n < 0){
+     sz = uvmdealloc(p->pagetable, sz, sz + n);
+   }
+@@ -274,7 +279,6 @@ fork(void)
+     return -1;
+   }
+   np->sz = p->sz;
+-
+   np->parent = p;
+ 
+   // copy saved user registers.
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..5d09d8a 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -47,8 +47,10 @@ sys_sbrk(void)
+   if(argint(0, &n) < 0)
+     return -1;
+   addr = myproc()->sz;
++
+   if(growproc(n) < 0)
+     return -1;
++
+   return addr;
+ }
+ 
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..c659876 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -67,7 +67,27 @@ usertrap(void)
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
+-  } else {
++  }
++#ifdef LAB_LAZY
++  else if(r_scause() == 13 || r_scause() == 15) {
++    uint64 va = PGROUNDDOWN(r_stval());
++    void *pa = kalloc();
++
++    if (pa == 0)
++      p->killed = 1;
++    else if (va >= p->sz || va < PGROUNDUP(p->trapframe->sp)) {
++      kfree(pa);
++      p->killed = 1;
++    } else {
++      memset(pa, 0, PGSIZE);
++      if (mappages(p->pagetable, va, PGSIZE, (uint64) pa, PTE_W | PTE_X | PTE_R | PTE_U) != 0) {
++        kfree(pa);
++        p->killed = 1;
++      }
++    }
++  }
++#endif
++  else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+     p->killed = 1;
+diff --git a/kernel/vm.c b/kernel/vm.c
+index bccb405..02333ff 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -6,6 +6,9 @@
+ #include "defs.h"
+ #include "fs.h"
+ 
++#include "spinlock.h"
++#include "proc.h"
++
+ /*
+  * the kernel's page table.
+  */
+@@ -96,11 +99,28 @@ walkaddr(pagetable_t pagetable, uint64 va)
+ {
+   pte_t *pte;
+   uint64 pa;
++  struct proc* p = myproc();
+ 
+   if(va >= MAXVA)
+     return 0;
+ 
+   pte = walk(pagetable, va, 0);
++
++#ifdef LAB_LAZY
++  if (pte == 0 || (*pte & PTE_V) == 0) {
++    if (va < p->sz && va >= PGROUNDUP(p->trapframe->sp)) {
++      void *pa = kalloc();
++      if (pa == 0)
++        return 0;
++      memset(pa, 0, PGSIZE);
++      if (mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64) pa, PTE_W | PTE_X | PTE_R | PTE_U) != 0) {
++        kfree(pa);
++        return 0;
++      }
++      pte = walk(pagetable, va, 0);
++    } else return 0;
++  }
++#endif
+   if(pte == 0)
+     return 0;
+   if((*pte & PTE_V) == 0)
+@@ -181,9 +201,17 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+ 
+   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+     if((pte = walk(pagetable, a, 0)) == 0)
++#ifdef LAB_LAZY
++      continue;
++#else
+       panic("uvmunmap: walk");
++#endif
+     if((*pte & PTE_V) == 0)
++#ifdef LAB_LAZY
++      continue;
++#else
+       panic("uvmunmap: not mapped");
++#endif
+     if(PTE_FLAGS(*pte) == PTE_V)
+       panic("uvmunmap: not a leaf");
+     if(do_free){
+@@ -315,9 +343,17 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+ 
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walk(old, i, 0)) == 0)
++#ifdef LAB_LAZY
++      continue;
++#else
+       panic("uvmcopy: pte should exist");
++#endif
+     if((*pte & PTE_V) == 0)
++#ifdef LAB_LAZY
++      continue;
++#else
+       panic("uvmcopy: page not present");
++#endif
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+     if((mem = kalloc()) == 0)
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..7813681
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++5
+\ No newline at end of file
+diff --git a/user/init.c b/user/init.c
+index e0a5689..3fa995d 100644
+--- a/user/init.c
++++ b/user/init.c
+@@ -7,6 +7,7 @@
+ #include "kernel/fs.h"
+ #include "kernel/file.h"
+ #include "user/user.h"
++#include "user.h"
+ #include "kernel/fcntl.h"
+ 
+ char *argv[] = { "sh", 0 };
+@@ -16,7 +17,7 @@ main(void)
+ {
+   int pid, wpid;
+ 
+-  if(open("console", O_RDWR) < 0){
++  if(open("console", O_RDWR) < 0){    // memo: open a file descriptor for the console
+     mknod("console", CONSOLE, 0);
+     open("console", O_RDWR);
+   }
+diff --git a/user/usertests.c b/user/usertests.c
+index 7300574..501d9ee 100644
+--- a/user/usertests.c
++++ b/user/usertests.c
+@@ -7,6 +7,7 @@
+ #include "kernel/syscall.h"
+ #include "kernel/memlayout.h"
+ #include "kernel/riscv.h"
++#include "user.h"
+ 
+ //
+ // Tests xv6 system calls.  usertests without arguments runs them all

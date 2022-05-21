@@ -1,0 +1,177 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 9b892ab..e65a5bc 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -8,6 +8,9 @@ struct spinlock;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++
++#define LAB_NET 1
++
+ #ifdef LAB_NET
+ struct mbuf;
+ struct sock;
+diff --git a/kernel/e1000.c b/kernel/e1000.c
+index 70a2adf..b401ce2 100644
+--- a/kernel/e1000.c
++++ b/kernel/e1000.c
+@@ -12,6 +12,10 @@
+ static struct tx_desc tx_ring[TX_RING_SIZE] __attribute__((aligned(16)));
+ static struct mbuf *tx_mbufs[TX_RING_SIZE];
+ 
++/* memo: The array of descriptors is called the receive ring,
++ * or receive queue. It's a circular ring in the sense that
++ * when the card or driver reaches the end of the array,
++ * it wraps back to the beginning.*/
+ #define RX_RING_SIZE 16
+ static struct rx_desc rx_ring[RX_RING_SIZE] __attribute__((aligned(16)));
+ static struct mbuf *rx_mbufs[RX_RING_SIZE];
+@@ -20,6 +24,7 @@ static struct mbuf *rx_mbufs[RX_RING_SIZE];
+ static volatile uint32 *regs;
+ 
+ struct spinlock e1000_lock;
++//struct spinlock e1000_lock2;
+ 
+ // called by pci_init().
+ // xregs is the memory address at which the
+@@ -30,6 +35,7 @@ e1000_init(uint32 *xregs)
+   int i;
+ 
+   initlock(&e1000_lock, "e1000");
++//  initlock(&e1000_lock2, "e10002");
+ 
+   regs = xregs;
+ 
+@@ -102,7 +108,38 @@ e1000_transmit(struct mbuf *m)
+   // the TX descriptor ring so that the e1000 sends it. Stash
+   // a pointer so that it can be freed after sending.
+   //
+-  
++
++  uint32 i;
++  struct tx_desc *d;
++  struct mbuf *m0;
++
++  acquire(&e1000_lock);
++  // tx ring index
++  i = regs[E1000_TDT];
++
++  // if the ring is overflowing
++  d = &tx_ring[i];
++  if (!(d->status & E1000_TXD_STAT_DD)) {
++    release(&e1000_lock);
++    return -1;
++  }
++
++  // free the last m0
++  m0 = tx_mbufs[i];
++  if (m0)
++    mbuffree(m0);
++
++  // fill in the descriptor
++//  memset(d, 0, sizeof(*d));
++  d->addr = (uint64) m->head;
++  d->length = m->len;
++  d->cmd = E1000_TXD_CMD_RS | E1000_TXD_CMD_EOP;
++  tx_mbufs[i] = m;
++
++  // update the ring position
++  regs[E1000_TDT] = (i + 1) % TX_RING_SIZE;
++  release(&e1000_lock);
++
+   return 0;
+ }
+ 
+@@ -115,6 +152,38 @@ e1000_recv(void)
+   // Check for packets that have arrived from the e1000
+   // Create and deliver an mbuf for each packet (using net_rx()).
+   //
++
++  uint32 i;
++  struct rx_desc *d;
++  struct mbuf *m;
++
++  while (1) {
++    // rx ring index
++    i = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
++
++    // if a new packet is available
++    d = &rx_ring[i];
++    if (!(d->status & E1000_RXD_STAT_DD))
++      break;
++
++    // update the mbuf
++    m = rx_mbufs[i];
++    m->len = d->length;
++
++    // deliver the mbuf to the network stack
++    net_rx(m);
++
++    // allocate a new mbuf
++    m = mbufalloc(0);
++    if (!m)
++      panic("e1000_recv: mbufalloc");
++    rx_mbufs[i] = m;
++    d->addr = (uint64) m->head;
++    d->status = 0;
++
++    // update the E1000_RDT register
++    regs[E1000_RDT] = i;
++  }
+ }
+ 
+ void
+diff --git a/kernel/e1000_dev.h b/kernel/e1000_dev.h
+index 9b462df..9b93651 100644
+--- a/kernel/e1000_dev.h
++++ b/kernel/e1000_dev.h
+@@ -112,6 +112,10 @@ struct tx_desc
+ #define E1000_RXD_STAT_DD       0x01    /* Descriptor Done */
+ #define E1000_RXD_STAT_EOP      0x02    /* End of Packet */
+ 
++/* memo: The E1000 requires these buffers to be described by
++ * an array of "descriptors" in RAM; each descriptor contains
++ * an address in RAM where the E1000 can write a received packet*/
++
+ // [E1000 3.2.3]
+ struct rx_desc
+ {
+diff --git a/kernel/net.h b/kernel/net.h
+index 9e6fefe..a2fe471 100644
+--- a/kernel/net.h
++++ b/kernel/net.h
+@@ -5,6 +5,10 @@
+ #define MBUF_SIZE              2048
+ #define MBUF_DEFAULT_HEADROOM  128
+ 
++/* memo: Because bursts of packets might arrive faster
++ * than the driver can process them, e1000_init() provides
++ * the E1000 with multiple buffers into which the E1000
++ * can write packets.*/
+ struct mbuf {
+   struct mbuf  *next; // the next mbuf in the chain
+   char         *head; // the current start position of the buffer
+diff --git a/packets.pcap b/packets.pcap
+index 82d353e..8bbc51d 100644
+Binary files a/packets.pcap and b/packets.pcap differ
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..7813681
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++5
+\ No newline at end of file
+diff --git a/user/nettests.c b/user/nettests.c
+index edf46ef..6de7174 100644
+--- a/user/nettests.c
++++ b/user/nettests.c
+@@ -2,6 +2,7 @@
+ #include "kernel/net.h"
+ #include "kernel/stat.h"
+ #include "user/user.h"
++#include "user.h"
+ 
+ //
+ // send a UDP packet to the localhost (outside of qemu),

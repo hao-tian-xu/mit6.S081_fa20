@@ -1,0 +1,423 @@
+diff --git a/Makefile b/Makefile
+index 1fa367e..4797c8d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -175,8 +175,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-
+-
++	$U/_lab_questions\
++	$U/_alarmtest\
+ 
+ 
+ ifeq ($(LAB),$(filter $(LAB), pgtbl lock))
+@@ -252,7 +252,9 @@ clean:
+ 	$U/initcode $U/initcode.out $K/kernel fs.img \
+ 	mkfs/mkfs .gdbinit \
+         $U/usys.S \
+-	$(UPROGS)
++	$(UPROGS) \
++	*/*[2-9]* \
++	.*[2-9] *[2-9]*
+ 
+ # try to generate a unique GDB port
+ GDBPORT = $(shell expr `id -u` % 5000 + 25000)
+diff --git a/answers-traps.txt b/answers-traps.txt
+new file mode 100644
+index 0000000..c50c21e
+--- /dev/null
++++ b/answers-traps.txt
+@@ -0,0 +1,7 @@
++1.1 a2
++1.2 convert function call directly to number
++1.3 0x630
++1.4 0x38 (jalr rs --> jalr x0, 0(rs) // memo: x0 is ra for return address
++1.5 HE110 World
++    0x726c6400
++1.6 the value is whatever stored in a1 which shoud be the second argument but not provided
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 4b9bbc0..b924c06 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -80,6 +80,7 @@ int             pipewrite(struct pipe*, uint64, int);
+ void            printf(char*, ...);
+ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
++void            backtrace(void);
+ 
+ // proc.c
+ int             cpuid(void);
+@@ -185,3 +186,6 @@ void            virtio_disk_intr(void);
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
++
++// Added by Haotian Xu on 11/15/21.
++#define LAB_TRAP 1
+diff --git a/kernel/log.c b/kernel/log.c
+index 5e884bb..e51feb9 100644
+--- a/kernel/log.c
++++ b/kernel/log.c
+@@ -18,7 +18,7 @@
+ // A system call should call begin_op()/end_op() to mark
+ // its start and end. Usually begin_op() just increments
+ // the count of in-progress FS system calls and returns.
+-// But if it thinks the log is close to running out, it
++// But if it thinks the log is close to alarm_running out, it
+ // sleeps until the last outstanding end_op() commits.
+ //
+ // The log is a physical re-do log containing disk blocks.
+diff --git a/kernel/printf.c b/kernel/printf.c
+index e1347de..842dab2 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -121,6 +121,9 @@ panic(char *s)
+   printf("panic: ");
+   printf(s);
+   printf("\n");
++#ifdef LAB_TRAP
++  backtrace();    // Added by Haotian Xu on 11/15/21.
++#endif
+   panicked = 1; // freeze uart output from other CPUs
+   for(;;)
+     ;
+@@ -132,3 +135,20 @@ printfinit(void)
+   initlock(&pr.lock, "pr");
+   pr.locking = 1;
+ }
++
++// Created by Haotian Xu on 11/15/21.
++#ifdef LAB_TRAP
++void
++backtrace()
++{
++  uint64 fp = r_fp();
++  uint64 stacktop = PGROUNDUP(fp);
++  uint64 stackbottom = PGROUNDDOWN(fp);
++
++  printf("backtrace:\n");
++  while (fp > stackbottom && fp < stacktop) {
++    printf("%p\n", *((uint64*)(fp-8)));
++    fp = *((uint64*)(fp-16));
++  }
++}
++#endif
+diff --git a/kernel/proc.c b/kernel/proc.c
+index dab1e1d..8541d2a 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -121,6 +121,18 @@ found:
+     return 0;
+   }
+ 
++#ifdef LAB_TRAP
++  // Added by Haotian Xu on 11/15/21.
++  // Initialize Alarm
++  p->ticks = 0;
++  p->tickspassed = 0;
++  p->handler = 0;
++  if((p->alarm_trapframe = (struct trapframe *)kalloc()) == 0){
++    release(&p->lock);
++    return 0;
++  }
++#endif
++
+   // Set up new context to start executing at forkret,
+   // which returns to user space.
+   memset(&p->context, 0, sizeof(p->context));
+@@ -150,6 +162,16 @@ freeproc(struct proc *p)
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
++#ifdef LAB_TRAP
++  // Added by Haotian Xu on 11/15/21.
++  if(p->alarm_trapframe)
++    kfree((void*)p->alarm_trapframe);
++  p->alarm_trapframe = 0;
++  p->ticks = 0;
++  p->tickspassed = 0;
++  p->handler = 0;
++  p->alarm_running = 0;
++#endif
+ }
+ 
+ // Create a user page table for a given process,
+@@ -450,7 +472,7 @@ wait(uint64 addr)
+ // Each CPU calls scheduler() after setting itself up.
+ // Scheduler never returns.  It loops, doing:
+ //  - choose a process to run.
+-//  - swtch to start running that process.
++//  - swtch to start alarm_running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
+ void
+@@ -475,7 +497,7 @@ scheduler(void)
+         c->proc = p;
+         swtch(&c->context, &p->context);
+ 
+-        // Process is done running for now.
++        // Process is done alarm_running for now.
+         // It should have changed its p->state before coming back.
+         c->proc = 0;
+ 
+@@ -512,7 +534,7 @@ sched(void)
+   if(mycpu()->noff != 1)
+     panic("sched locks");
+   if(p->state == RUNNING)
+-    panic("sched running");
++    panic("sched alarm_running");
+   if(intr_get())
+     panic("sched interruptible");
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..cf1d2c5 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -20,7 +20,7 @@ struct context {
+ 
+ // Per-CPU state.
+ struct cpu {
+-  struct proc *proc;          // The process running on this cpu, or null.
++  struct proc *proc;          // The process alarm_running on this cpu, or null.
+   struct context context;     // swtch() here to enter scheduler().
+   int noff;                   // Depth of push_off() nesting.
+   int intena;                 // Were interrupts enabled before push_off()?
+@@ -103,4 +103,11 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  // Added by Haotian Xu on 11/15/21.
++  int ticks;
++  int tickspassed;
++  void (*handler)();
++  struct trapframe *alarm_trapframe;
++  int alarm_running;
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..d34ede8 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -352,3 +352,12 @@ sfence_vma()
+ 
+ typedef uint64 pte_t;
+ typedef uint64 *pagetable_t; // 512 PTEs
++
++// Created by Haotian Xu on 11/15/21.
++static inline uint64
++r_fp()
++{
++  uint64 x;
++  asm volatile("mv %0, s0" : "=r" (x) );
++  return x;
++}
+\ No newline at end of file
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..70a51b0 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_sigalarm(void);
++extern uint64 sys_sigreturn(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +129,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sigalarm]  sys_sigalarm,
++[SYS_sigreturn] sys_sigreturn,
+ };
+ 
+ void
+@@ -137,7 +141,8 @@ syscall(void)
+ 
+   num = p->trapframe->a7;
+   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+-    p->trapframe->a0 = syscalls[num]();
++    p->trapframe->a0 = syscalls[num]();   // memo: save the return value of syscall to saved a0 register in trapframe
++                                          //       to be retrieved to a0 register by userret in trampoline.S
+   } else {
+     printf("%d %s: unknown sys call %d\n",
+             p->pid, p->name, num);
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..b2b13a1 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++// Added by Haotian Xu on 11/15/21.
++#define SYS_sigalarm  22
++#define SYS_sigreturn 23
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 5dc453b..83eff65 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -484,3 +484,36 @@ sys_pipe(void)
+   }
+   return 0;
+ }
++
++#ifdef LAB_TRAP
++// Created by Haotian Xu on 11/15/21.
++int
++sys_sigalarm(void)
++{
++  int ticks;
++  uint64 handler;
++  struct proc *p = myproc();
++
++  if(argint(0, &ticks) < 0)
++    return -1;
++  if(argaddr(1, &handler) < 0)
++    return -1;
++
++  p->ticks = ticks;
++  p->handler = (void (*)())handler;
++
++  return 0;
++}
++
++// Created by Haotian Xu on 11/15/21.
++int
++sys_sigreturn(void)
++{
++  struct proc *p = myproc();
++  *p->trapframe = *p->alarm_trapframe;
++  p->alarm_running = 0;
++  usertrapret();
++
++  return 0;
++}
++#endif
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..196615d 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -69,6 +69,9 @@ sys_sleep(void)
+     }
+     sleep(&ticks, &tickslock);
+   }
++#ifdef LAB_TRAP
++  backtrace();    // Added by Haotian Xu on 11/15/21.
++#endif
+   release(&tickslock);
+   return 0;
+ }
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..6838af7 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -77,9 +77,24 @@ usertrap(void)
+     exit(-1);
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2)
++  if(which_dev == 2) {
+     yield();
++#ifdef LAB_TRAP
++    // Added by Haotian Xu on 11/15/21.
++    if (p->ticks == 0) goto end;
++    else {
++      p->tickspassed += 1;
++      if (p->tickspassed >= p->ticks && !p->alarm_running) {
++        p->tickspassed -= p->ticks;
++        *p->alarm_trapframe = *p->trapframe;
++        p->trapframe->epc = (uint64)p->handler;
++        p->alarm_running = 1;
++      }
++    }
++#endif
++  }
+ 
++end:
+   usertrapret();
+ }
+ 
+@@ -112,7 +127,7 @@ usertrapret(void)
+   // set S Previous Privilege mode to User.
+   unsigned long x = r_sstatus();
+   x &= ~SSTATUS_SPP; // clear SPP to 0 for user mode
+-  x |= SSTATUS_SPIE; // enable interrupts in user mode
++  x |= SSTATUS_SPIE; // enable interrupts in user mode  // memo: actually SPIE will be copied to PIE when calling sret in userret in trampoline.S, which will enable interrupt in Supervisor Mode
+   w_sstatus(x);
+ 
+   // set S Exception Program Counter to the saved user pc.
+diff --git a/kernel/vm.c b/kernel/vm.c
+index bccb405..d0c919b 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -410,7 +410,7 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+ 
+   while(got_null == 0 && max > 0){
+     va0 = PGROUNDDOWN(srcva);
+-    pa0 = walkaddr(pagetable, va0);
++    pa0 = walkaddr(pagetable, va0);   // memo: this makes sure programs can only use process' va space
+     if(pa0 == 0)
+       return -1;
+     n = PGSIZE - (srcva - va0);
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..62f9457
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++6
+\ No newline at end of file
+diff --git a/user/alarmtest.c b/user/alarmtest.c
+index 38f09ff..891d0f3 100644
+--- a/user/alarmtest.c
++++ b/user/alarmtest.c
+@@ -11,6 +11,7 @@
+ #include "kernel/stat.h"
+ #include "kernel/riscv.h"
+ #include "user/user.h"
++#include "user.h"
+ 
+ void test0();
+ void test1();
+diff --git a/user/user.h b/user/user.h
+index b71ecda..a6ea56a 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,9 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++// Added by Haotian Xu on 11/15/21.
++int sigalarm(int ticks, void (*handler)());
++int sigreturn(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usertests.c b/user/usertests.c
+index 004c948..07e88a4 100644
+--- a/user/usertests.c
++++ b/user/usertests.c
+@@ -2143,7 +2143,7 @@ sbrkfail(char *s)
+     exit(1);
+   }
+ 
+-  // test running fork with the above allocated page 
++  // test alarm_running fork with the above allocated page
+   pid = fork();
+   if(pid < 0){
+     printf("%s: fork failed\n", s);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..fa548b0 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("sigalarm");
++entry("sigreturn");
