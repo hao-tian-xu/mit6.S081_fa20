@@ -4,7 +4,7 @@
 
 This repository shares the learning process of the course 6.S081 with online materials from MIT. The results are divided into the following two parts:
 
-1. Labs solutions (with commit history) in [this repository](https://github.com/splendidField/mit6.031_sp16_pset) 
+1. Labs solutions (with commit history) in [this repository](https://github.com/splendidField/xv6-labs-2020) 
    - Different labs are in different branches.
    - Handins are also uploaded for convenience.
 
