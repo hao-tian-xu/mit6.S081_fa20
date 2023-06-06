@@ -15,7 +15,6 @@ This repository shares the learning process of the course 6.S081 with online mat
 
 ## License
 
-This work is a derivative of "[6.S081: Operating System Engineering](https://pdos.csail.mit.edu/6.S081/2020/index.html)", used under CC BY 3.0 US.
+This work is a derivative of "[6.S081: Operating System Engineering](https://pdos.csail.mit.edu/6.S081/2020/index.html)" by Frans Kaashoek and Robert Morris, used under CC BY 3.0 US.
 
 [![License: CC BY 3.0 US](https://licensebuttons.net/l/by/3.0/us/88x31.png)](https://creativecommons.org/licenses/by/3.0/us/)
-
